@@ -2,17 +2,24 @@ import os
 import time
 import subprocess
 import json
-from typing import Dict, Any
-from openai import OpenAI
+from typing import Dict, Any, List  # Thêm List vào đây
+from dotenv import load_dotenv
+
+import google.generativeai as genai
 import sanitizer
 
 # --- CONFIGURATION ---
-ADB_PATH = "adb"  # Ensure adb is in your PATH
-MODEL = "gpt-4o"  # Or "gpt-4-turbo" for faster/cheaper execution
+load_dotenv()
+ADB_PATH = "adb"  
+MODEL_NAME = "gemini-2.5-flash"  
 SCREEN_DUMP_PATH = "/sdcard/window_dump.xml"
 LOCAL_DUMP_PATH = "window_dump.xml"
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Cấu hình API Key
+api_key = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel(MODEL_NAME)
 
 def run_adb_command(command: List[str]):
     """Executes a shell command via ADB."""
@@ -23,13 +30,9 @@ def run_adb_command(command: List[str]):
 
 def get_screen_state() -> str:
     """Dumps the current UI XML and returns the sanitized JSON string."""
-    # 1. Capture XML
     run_adb_command(["shell", "uiautomator", "dump", SCREEN_DUMP_PATH])
-    
-    # 2. Pull to local
     run_adb_command(["pull", SCREEN_DUMP_PATH, LOCAL_DUMP_PATH])
     
-    # 3. Read & Sanitize
     if not os.path.exists(LOCAL_DUMP_PATH):
         return "Error: Could not capture screen."
         
@@ -44,22 +47,24 @@ def execute_action(action: Dict[str, Any]):
     act_type = action.get("action")
     
     if act_type == "tap":
-        x, y = action.get("coordinates")
-        print(f"👉 Tapping: ({x}, {y})")
-        run_adb_command(["shell", "input", "tap", str(x), str(y)])
+        coords = action.get("coordinates")
+        if coords:
+            x, y = coords
+            print(f"👉 Tapping: ({x}, {y})")
+            run_adb_command(["shell", "input", "tap", str(x), str(y)])
         
     elif act_type == "type":
-        text = action.get("text").replace(" ", "%s") # ADB requires %s for spaces
+        text = action.get("text", "").replace(" ", "%s")
         print(f"⌨️ Typing: {action.get('text')}")
         run_adb_command(["shell", "input", "text", text])
         
     elif act_type == "home":
         print("🏠 Going Home")
-        run_adb_command(["shell", "input", "keyevent", "KEYWORDS_HOME"])
+        run_adb_command(["shell", "input", "keyevent", "3"]) # Mã 3 là Home
         
     elif act_type == "back":
         print("🔙 Going Back")
-        run_adb_command(["shell", "input", "keyevent", "KEYWORDS_BACK"])
+        run_adb_command(["shell", "input", "keyevent", "4"]) # Mã 4 là Back
         
     elif act_type == "wait":
         print("⏳ Waiting...")
@@ -70,62 +75,48 @@ def execute_action(action: Dict[str, Any]):
         exit(0)
 
 def get_llm_decision(goal: str, screen_context: str) -> Dict[str, Any]:
-    """Sends screen context to LLM and asks for the next move."""
-    system_prompt = """
-    You are an Android Driver Agent. Your job is to achieve the user's goal by navigating the UI.
+    """Sends screen context to Gemini and asks for the next move."""
+    prompt = f"""
+    You are an Android Driver Agent. Output ONLY a valid JSON object.
     
-    You will receive:
-    1. The User's Goal.
-    2. A list of interactive UI elements (JSON) with their (x,y) center coordinates.
-    
-    You must output ONLY a valid JSON object with your next action.
-    
+    GOAL: {goal}
+    SCREEN_CONTEXT:
+    {screen_context}
+
     Available Actions:
-    - {"action": "tap", "coordinates": [x, y], "reason": "Why you are tapping"}
-    - {"action": "type", "text": "Hello World", "reason": "Why you are typing"}
-    - {"action": "home", "reason": "Go to home screen"}
-    - {"action": "back", "reason": "Go back"}
-    - {"action": "wait", "reason": "Wait for loading"}
-    - {"action": "done", "reason": "Task complete"}
-    
-    Example Output:
-    {"action": "tap", "coordinates": [540, 1200], "reason": "Clicking the 'Connect' button"}
+    - {{"action": "tap", "coordinates": [x, y], "reason": "..."}}
+    - {{"action": "type", "text": "...", "reason": "..."}}
+    - {{"action": "home", "reason": "..."}}
+    - {{"action": "back", "reason": "..."}}
+    - {{"action": "wait", "reason": "..."}}
+    - {{"action": "done", "reason": "..."}}
     """
     
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"}
-        ]
+    # Cú pháp chuẩn của Gemini SDK
+    response = model.generate_content(
+        prompt,
+        generation_config={"response_mime_type": "application/json"}
     )
     
-    return json.loads(response.choices[0].message.content)
+    return json.loads(response.text)
 
 def run_agent(goal: str, max_steps=10):
     print(f"🚀 Android Use Agent Started. Goal: {goal}")
-    
     for step in range(max_steps):
         print(f"\n--- Step {step + 1} ---")
-        
-        # 1. Perception
         print("👀 Scanning Screen...")
         screen_context = get_screen_state()
         
-        # 2. Reasoning
         print("🧠 Thinking...")
-        decision = get_llm_decision(goal, screen_context)
-        print(f"💡 Decision: {decision.get('reason')}")
+        try:
+            decision = get_llm_decision(goal, screen_context)
+            print(f"💡 Decision: {decision.get('reason')}")
+            execute_action(decision)
+        except Exception as e:
+            print(f"❌ Error during decision/action: {e}")
         
-        # 3. Action
-        execute_action(decision)
-        
-        # Wait for UI to update
         time.sleep(2)
 
 if __name__ == "__main__":
-    # Example Goal: "Open settings and turn on Wi-Fi"
-    # Or your demo goal: "Find the 'Connect' button and tap it"
     GOAL = input("Enter your goal: ")
     run_agent(GOAL)
